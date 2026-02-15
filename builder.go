@@ -44,6 +44,9 @@ type Builder struct {
 	RaceDetector bool          `json:"race_detector,omitempty"`
 	SkipCleanup  bool          `json:"skip_cleanup,omitempty"`
 	SkipBuild    bool          `json:"skip_build,omitempty"`
+	BuildPlugin  bool          `json:"build_plugin,omitempty"`
+	CaddyBin     string        `json:"caddy_bin,omitempty"`
+	PluginDir    string        `json:"plugin_dir,omitempty"`
 	Debug        bool          `json:"debug,omitempty"`
 	BuildFlags   string        `json:"build_flags,omitempty"`
 	ModFlags     string        `json:"mod_flags,omitempty"`
@@ -150,8 +153,12 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 	}
 
 	// compile
+	args := []string{}
+	if b.BuildPlugin {
+		args = append(args, "-buildmode=plugin")
+	}
 	cmd, err := buildEnv.newGoBuildCommand(ctx, "build",
-		"-o", absOutputFile,
+		append([]string{"-o", absOutputFile}, args...)...,
 	)
 	if err != nil {
 		return err
@@ -160,7 +167,7 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 		// support dlv
 		cmd.Args = append(cmd.Args, "-gcflags", "all=-N -l")
 	} else {
-		if buildEnv.buildFlags == "" {
+		if buildEnv.buildFlags == "" && b.CaddyBin == "" {
 			cmd.Args = append(cmd.Args,
 				"-ldflags", "-w -s", // trim debug symbols
 				"-trimpath",

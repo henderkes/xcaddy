@@ -209,6 +209,19 @@ $ xcaddy version
 ```
 
 
+### Building Go plugins
+
+_Experimental._
+
+Caddy can load Go plugins that were built with `build-plugin`. For this to work, the versions of Caddy's dependencies must match exactly between the Caddy executable and the plugin.
+
+```bash
+$ xcaddy build-plugin [<caddy_version>] \
+    [--caddy <path_to_caddy_executable>] \
+    [--plugin-dir <path_to_existing_plugin_directory>] \
+    --with <module[@version][=replacement]>...
+```
+
 ## Library usage
 
 ```go

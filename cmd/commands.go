@@ -19,6 +19,12 @@ func init() {
 	buildCommand.Flags().String("output", "", "change the output file name")
 	buildCommand.Flags().StringArray("replace", []string{}, "like --with but for Go modules")
 	buildCommand.Flags().StringArray("embed", []string{}, "embeds directories into the built Caddy executable to use with the `embedded` file-system")
+
+	buildPluginCommand.Flags().StringArray("with", []string{}, "caddy modules package path to include in the build")
+	buildPluginCommand.Flags().String("output", "", "change the output file name")
+	buildPluginCommand.Flags().String("caddy", "", "path to a Caddy executable to align dependency versions with")
+	buildPluginCommand.Flags().String("plugin-dir", "", "directory containing already compiled plugins to align dependency versions with")
+	buildPluginCommand.Flags().StringArray("replace", []string{}, "like --with but for Go modules")
 }
 
 var versionCommand = &cobra.Command{
@@ -175,6 +181,122 @@ Flags:
 			if err != nil {
 				log.Fatalf("[FATAL] %v", err)
 			}
+		}
+
+		return nil
+	},
+}
+
+var buildPluginCommand = &cobra.Command{
+	Use: `build-plugin [<caddy_version>]
+    [--output <file>]
+    [--caddy <file>]
+    [--plugin-dir <dir>]
+    [--with <module[@version][=replacement]>...]
+    [--replace <module[@version]=replacement>...]`,
+	Long: `
+<caddy_version> is the core Caddy version to build against; defaults to CADDY_VERSION env variable or latest.
+This can be the keyword latest, which will use the latest stable tag, or any git ref such as:
+
+A tag like v2.0.1
+A branch like master
+A commit like a58f240d3ecbb59285303746406cab50217f8d24
+
+Flags: 
+ --output changes the output file.
+
+ --caddy provides the path to an existing Caddy executable. xcaddy will extract the versions of its dependencies and use them for the plugin build to ensure compatibility.
+
+ --plugin-dir provides the path to a directory containing existing plugins. xcaddy will extract the versions of their dependencies and use them for the plugin build to ensure compatibility.
+
+ --with can be used multiple times to add plugins by specifying the Go module name and optionally its version, similar to go get. Module name is required, but specific version and/or local replacement are optional.
+
+ --replace is like --with, but does not add a blank import to the code; it only writes a replace directive to go.mod, which is useful when developing on Caddy's dependencies (ones that are not Caddy modules). Try this if you got an error when using --with, like cannot find module providing package.
+`,
+	Short: "Compile Caddy plugins as a Go plugin",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		var output, caddyBin, pluginDir string
+		var plugins []xcaddy.Dependency
+		var replacements []xcaddy.Replace
+		var argCaddyVersion string
+		if len(args) > 0 {
+			argCaddyVersion = args[0]
+		}
+		withArgs, err := cmd.Flags().GetStringArray("with")
+		if err != nil {
+			return fmt.Errorf("unable to parse --with arguments: %s", err.Error())
+		}
+
+		replaceArgs, err := cmd.Flags().GetStringArray("replace")
+		if err != nil {
+			return fmt.Errorf("unable to parse --replace arguments: %s", err.Error())
+		}
+		for _, withArg := range withArgs {
+			mod, ver, repl, err := splitWith(withArg)
+			if err != nil {
+				return err
+			}
+			mod = strings.TrimSuffix(mod, "/")
+			plugins = append(plugins, xcaddy.Dependency{
+				PackagePath: mod,
+				Version:     ver,
+			})
+			handleReplace(withArg, mod, ver, repl, &replacements)
+		}
+
+		for _, withArg := range replaceArgs {
+			mod, ver, repl, err := splitWith(withArg)
+			if err != nil {
+				return err
+			}
+			handleReplace(withArg, mod, ver, repl, &replacements)
+		}
+
+		output, err = cmd.Flags().GetString("output")
+		if err != nil {
+			return fmt.Errorf("unable to parse --output arguments: %s", err.Error())
+		}
+
+		caddyBin, err = cmd.Flags().GetString("caddy")
+		if err != nil {
+			return fmt.Errorf("unable to parse --caddy arguments: %s", err.Error())
+		}
+
+		pluginDir, err = cmd.Flags().GetString("plugin-dir")
+		if err != nil {
+			return fmt.Errorf("unable to parse --plugin-dir arguments: %s", err.Error())
+		}
+		if argCaddyVersion != "" {
+			caddyVersion = argCaddyVersion
+		}
+
+		// ensure an output file is always specified
+		if output == "" {
+			output = "caddy.so"
+		}
+
+		// perform the build
+		builder := xcaddy.Builder{
+			Compile: xcaddy.Compile{
+				Cgo: true, // plugins require CGO
+			},
+			CaddyVersion: caddyVersion,
+			Plugins:      plugins,
+			Replacements: replacements,
+			RaceDetector: raceDetector,
+			SkipBuild:    skipBuild,
+			SkipCleanup:  skipCleanup,
+			Debug:        buildDebugOutput,
+			BuildFlags:   buildFlags,
+			ModFlags:     modFlags,
+			BuildPlugin:  true,
+			CaddyBin:     caddyBin,
+			PluginDir:    pluginDir,
+		}
+		err = builder.Build(cmd.Root().Context(), output)
+		if err != nil {
+			log.Fatalf("[FATAL] %v", err)
 		}
 
 		return nil

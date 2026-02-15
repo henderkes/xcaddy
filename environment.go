@@ -17,6 +17,7 @@ package xcaddy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -59,7 +60,13 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 
 	// evaluate the template for the main module
 	var buf bytes.Buffer
-	tpl, err := template.New("main").Parse(mainModuleTemplate)
+	templateName := "main"
+	templateContent := mainModuleTemplate
+	if b.BuildPlugin {
+		templateName = "plugin"
+		templateContent = pluginModuleTemplate
+	}
+	tpl, err := template.New(templateName).Parse(templateContent)
 	if err != nil {
 		return nil, err
 	}
@@ -132,12 +139,19 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 		skipCleanup:     b.SkipCleanup,
 		buildFlags:      b.BuildFlags,
 		modFlags:        b.ModFlags,
+		caddyBin:        b.CaddyBin,
+		pluginDir:       b.PluginDir,
 	}
 
 	// initialize the go module
 	log.Println("[INFO] Initializing Go module")
+	modName := "caddy"
+	if b.BuildPlugin && len(b.Plugins) > 0 {
+		// use a unique module name for plugins so multiple plugins can be loaded
+		modName = "caddyplugin_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(b.Plugins[0].PackagePath)
+	}
 	cmd := env.newGoModCommand(ctx, "init")
-	cmd.Args = append(cmd.Args, "caddy")
+	cmd.Args = append(cmd.Args, modName)
 	err = env.runCommand(ctx, cmd)
 	if err != nil {
 		return nil, err
@@ -148,16 +162,6 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 	for _, r := range b.Replacements {
 		log.Printf("[INFO] Replace %s => %s", r.Old.String(), r.New.String())
 		replaced[r.Old.String()] = r.New.String()
-	}
-	if len(replaced) > 0 {
-		cmd := env.newGoModCommand(ctx, "edit")
-		for o, n := range replaced {
-			cmd.Args = append(cmd.Args, "-replace", fmt.Sprintf("%s=%s", o, n))
-		}
-		err := env.runCommand(ctx, cmd)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	// check for early abort
@@ -175,45 +179,163 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 		defer cancel()
 	}
 
-	// pin versions by populating go.mod, first for Caddy itself and then plugins
 	log.Println("[INFO] Pinning versions")
-	err = env.execGoGet(ctx, caddyModulePath, env.caddyVersion, "", "")
-	if err != nil {
-		return nil, err
+	binDeps := make(map[string]string)
+	
+	// files to extract versions from
+	var extractFrom []string
+	if env.caddyBin != "" {
+		extractFrom = append(extractFrom, env.caddyBin)
 	}
-nextPlugin:
-	for _, p := range b.Plugins {
-		// still fetch new modules and check is the latest or tagged version is viable
-		// regardless if this is in reference to a local module, lexical submodule or minor semantic revision.
-		//
-		// see issue caddyserver/xcaddy/issues/221 for more info about line
-		// with or without `if strings.HasPrefix(p.PackagePath, repl+"/") ... `
-		//
-		// In the case of lexical submodules:
-		// say you are requiring both submodules libdns<version> *and* libdns-provider<your new dns provider>
-		// your new local dns provder module prefixed with `libdns-` will be skipped when running
-		// xcaddy `build --with libdns-provider<your new dns provider> ...`
-		//
-		// In the case of semantic and/or local submodules:
-		// say you are requiring both submodules <template> and <template>-caddy,
-		// where you are working on your template module.
-		// xcaddy build --with FQDN/<template>-caddy@<Real Tag> --with FQDN/<template=.
-		//
-		// You should expect xcaddy to be able fetch newer submodule versions, i.e.
-		//   FQDN/<template>-caddy@<Real Tag+1>
-		// or properly fail if you specify a false minor semantic revision submodule,
-		//   FQDN/<template>-caddy@<False Tag+9>
-		// while working from its parent module directory as a local override.
-		//
-		// This is all to say, while we iterate and check prefixes,
-		// a plugin package may be a subfolder of a module, i.e.
-		// foo/a/plugin is within module foo/a
-		// *or* a lexical submodule, and in either case tagged versions should be checked.
-		for repl := range replaced {
-			if strings.HasPrefix(p.PackagePath, repl+"/") {
-				continue nextPlugin
+	if env.pluginDir != "" {
+		files, err := os.ReadDir(env.pluginDir)
+		if err != nil {
+			return nil, fmt.Errorf("reading plugin directory: %v", err)
+		}
+		for _, f := range files {
+			if f.IsDir() {
+				continue
+			}
+			// normally Caddy plugins are .so files
+			if strings.HasSuffix(f.Name(), ".so") {
+				extractFrom = append(extractFrom, filepath.Join(env.pluginDir, f.Name()))
 			}
 		}
+	}
+
+	for _, file := range extractFrom {
+		log.Printf("[INFO] Extracting dependency versions from %s", file)
+		cmd := exec.Command(utils.GetGo(), "version", "-m", file)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		if err != nil {
+			return nil, fmt.Errorf("getting version from %s: %v", file, err)
+		}
+
+		var extractedTags string
+		var extractedTrimpath bool
+		lines := strings.Split(out.String(), "\n")
+		for i := 0; i < len(lines); i++ {
+			line := strings.TrimSpace(lines[i])
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			if parts[0] == "path" && len(parts) >= 3 && (parts[1] == defaultCaddyModulePath || strings.HasPrefix(parts[1], defaultCaddyModulePath+"/")) {
+				// if CaddyVersion was not specified, we can use the one from the binary (only if it's the main caddy binary)
+				if env.caddyVersion == "" && file == env.caddyBin {
+					env.caddyVersion = parts[2]
+				}
+				continue
+			}
+			if parts[0] == "dep" && len(parts) >= 3 {
+				mod, ver := parts[1], parts[2]
+				
+				// if we already have this dependency, check if versions match
+				if existingVer, ok := binDeps[mod]; ok && existingVer != ver {
+					log.Printf("[WARNING] Dependency version mismatch for %s: %s (from %s) vs %s (already seen). Using %s.", mod, ver, file, existingVer, existingVer)
+					// For now, we keep the first one we saw. 
+					// In a real Caddy build, it would resolve to the latest fitting version.
+					// But since we are aligning with existing binaries, we have a conflict.
+					continue
+				}
+				binDeps[mod] = ver
+
+				// check if there's a replacement for this dependency on the next line
+				replacement := ""
+				if i+1 < len(lines) {
+					nextLine := strings.TrimSpace(lines[i+1])
+					if strings.HasPrefix(nextLine, "=>") {
+						nextParts := strings.Fields(nextLine)
+						if len(nextParts) >= 2 {
+							replacement = nextParts[1]
+							i++ // skip the replacement line in the next iteration
+						}
+					}
+				}
+
+				if replacement != "" {
+					// only use replacement from binary if not already specified by user
+					if _, ok := replaced[mod]; !ok {
+						log.Printf("[INFO] Extracting replacement %s => %s (from %s)", mod, replacement, file)
+
+						// if replacement is relative, resolve it relative to the binary's location
+						if strings.HasPrefix(replacement, ".") {
+							binAbs, err := filepath.Abs(file)
+							if err == nil {
+								replacement = filepath.Join(filepath.Dir(binAbs), replacement)
+								replacement = filepath.Clean(replacement)
+							}
+						}
+						replaced[mod] = replacement
+					} else {
+						// if it's already in 'replaced', it could be from user or from previous file
+						// we only log if it was from user (which is already done or will be done)
+						// log.Printf("[INFO] Using existing replacement for %s instead of %s from %s", mod, replacement, file)
+					}
+				}
+				continue
+			}
+			// build flags are only extracted from the main Caddy binary
+			if file == env.caddyBin && parts[0] == "build" && len(parts) >= 2 {
+				for _, part := range parts[1:] {
+					arg, val, hasVal := strings.Cut(part, "=")
+					switch arg {
+					case "-trimpath":
+						if !hasVal || val == "true" {
+							extractedTrimpath = true
+						}
+					case "-tags":
+						if hasVal {
+							extractedTags = val
+						}
+					}
+				}
+				// also handle the case where tags are a separate argument
+				if parts[1] == "-tags" && len(parts) >= 3 {
+					extractedTags = parts[2]
+				}
+			}
+		}
+
+		if extractedTrimpath {
+			if !strings.Contains(env.buildFlags, "-trimpath") {
+				if env.buildFlags != "" {
+					env.buildFlags = "-trimpath " + env.buildFlags
+				} else {
+					env.buildFlags = "-trimpath"
+				}
+			}
+		}
+		if extractedTags != "" {
+			if !strings.Contains(env.buildFlags, "-tags") {
+				if env.buildFlags != "" {
+					env.buildFlags = "-tags " + extractedTags + " " + env.buildFlags
+				} else {
+					env.buildFlags = "-tags " + extractedTags
+				}
+			}
+		}
+		if (extractedTrimpath || extractedTags != "") && file == env.caddyBin {
+			log.Printf("[INFO] Using build flags from binary: %s", env.buildFlags)
+		}
+	}
+
+	if len(replaced) > 0 {
+		cmd := env.newGoModCommand(ctx, "edit")
+		for o, n := range replaced {
+			cmd.Args = append(cmd.Args, "-replace", fmt.Sprintf("%s=%s", o, n))
+		}
+		err := env.runCommand(ctx, cmd)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// fetch new modules and check if the latest or tagged version is viable
+	// regardless if this is in reference to a local module, lexical submodule or minor semantic revision.
+	for _, p := range b.Plugins {
 		// also pass the Caddy version to prevent it from being upgraded
 		err = env.execGoGet(ctx, p.PackagePath, p.Version, caddyModulePath, env.caddyVersion)
 		if err != nil {
@@ -227,9 +349,96 @@ nextPlugin:
 		}
 	}
 
+	// if we have a reference binary, we now pin the versions of the modules
+	// that are actually in the module graph to match the binary.
+	if len(binDeps) > 0 {
+		log.Println("[INFO] Aligning versions with Caddy binary")
+
+		// First, pin Caddy itself to the version in the binary if not specified by user.
+		// This sets the baseline for all Caddy-related dependencies.
+		err = env.execGoGet(ctx, caddyModulePath, env.caddyVersion, "", "")
+		if err != nil {
+			return nil, err
+		}
+
+		// Get the current module graph after pinning Caddy and adding plugins.
+		// We use -json to get both the module path and the currently selected version.
+		cmd, err := env.newGoBuildCommand(ctx, "list", "-m", "-json", "all")
+		if err != nil {
+			return nil, err
+		}
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err = env.runCommand(ctx, cmd)
+		if err != nil {
+			return nil, err
+		}
+
+		type modInfo struct {
+			Path    string
+			Version string
+		}
+		currentMods := make(map[string]string)
+		
+		// go list -json all outputs multiple JSON objects
+		dec := json.NewDecoder(&out)
+		for dec.More() {
+			var mi modInfo
+			if err := dec.Decode(&mi); err != nil {
+				break
+			}
+			currentMods[mi.Path] = mi.Version
+		}
+
+		for mod, ver := range binDeps {
+			// Skip Caddy itself and its submodules
+			if mod == caddyModulePath || strings.HasPrefix(mod, caddyModulePath+"/") {
+				continue
+			}
+
+			// Skip the plugin we're building
+			isPlugin := false
+			for _, p := range env.plugins {
+				if p.PackagePath == mod {
+					isPlugin = true
+					break
+				}
+			}
+			if isPlugin {
+				continue
+			}
+
+			// Check if this module is even in our current module graph
+			currentVer, ok := currentMods[mod]
+			if !ok {
+				// Not in the graph, don't pin it (this is the key to speed!)
+				continue
+			}
+
+			// If it's already at the version we want, skip pinning
+			if currentVer == ver {
+				continue
+			}
+
+			log.Printf("[INFO] Pinning %s to %s (from %s; currently %s)", mod, ver, env.caddyBin, currentVer)
+			err := env.execGoGet(ctx, mod, ver, "", "")
+			if err != nil {
+				log.Printf("[WARNING] Could not pin %s to %s: %v", mod, ver, err)
+			}
+		}
+	} else {
+		// No reference binary, just pin Caddy core
+		err = env.execGoGet(ctx, caddyModulePath, env.caddyVersion, "", "")
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// doing an empty "go get -d" can potentially resolve some
 	// ambiguities introduced by one of the plugins;
 	// see https://github.com/caddyserver/xcaddy/pull/92
+	// For plugin builds, we want to ensure we don't pick up incompatible assembly,
+	// so we use the same build flags (especially tags) as the reference binary.
 	err = env.execGoGet(ctx, "", "", "", "")
 	if err != nil {
 		return nil, err
@@ -248,6 +457,8 @@ type environment struct {
 	skipCleanup     bool
 	buildFlags      string
 	modFlags        string
+	caddyBin        string
+	pluginDir       string
 }
 
 // Close cleans up the build environment, including deleting
@@ -287,8 +498,7 @@ func (env environment) newGoBuildCommand(ctx context.Context, goCommand string, 
 // created command will also have the value of `XCADDY_GO_MOD_FLAGS` appended to its arguments, if set.
 func (env environment) newGoModCommand(ctx context.Context, args ...string) *exec.Cmd {
 	args = append([]string{"mod"}, args...)
-	cmd := env.newCommand(ctx, utils.GetGo(), args...)
-	return parseAndAppendFlags(cmd, env.modFlags)
+	return env.newCommand(ctx, utils.GetGo(), args...)
 }
 
 func parseAndAppendFlags(cmd *exec.Cmd, flags string) *exec.Cmd {
@@ -372,6 +582,7 @@ func (env environment) execGoGet(ctx context.Context, modulePath, moduleVersion,
 	if err != nil {
 		return err
 	}
+
 	// using an empty string as an additional argument to "go get"
 	// breaks the command since it treats the empty string as a
 	// distinct argument, so we're using an if statement to avoid it.
@@ -404,6 +615,18 @@ import (
 func main() {
 	caddycmd.Main()
 }
+`
+
+const pluginModuleTemplate = `package main
+
+import (
+	_ "{{.CaddyModule}}/modules/standard"
+	{{- range .Plugins}}
+	_ "{{.}}"
+	{{- end}}
+)
+
+func main() {}
 `
 
 // originally published in: https://github.com/mholt/caddy-embed

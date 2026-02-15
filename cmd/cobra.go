@@ -113,5 +113,6 @@ func init() {
 	rootCmd.SetVersionTemplate("{{.Version}}\n")
 	rootCmd.SetHelpTemplate(rootCmd.HelpTemplate() + "\n" + fullDocsFooter + "\n")
 	rootCmd.AddCommand(buildCommand)
+	rootCmd.AddCommand(buildPluginCommand)
 	rootCmd.AddCommand(versionCommand)
 }
