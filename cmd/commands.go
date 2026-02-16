@@ -273,7 +273,13 @@ Flags:
 
 		// ensure an output file is always specified
 		if output == "" {
-			output = "caddy.so"
+			if len(plugins) == 1 {
+				output = "caddyplugin_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(plugins[0].PackagePath) + ".so"
+			} else if len(plugins) > 1 {
+				output = "caddyplugins_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(plugins[0].PackagePath) + ".so"
+			} else {
+				output = "caddy.so"
+			}
 		}
 
 		// perform the build
