@@ -248,10 +248,12 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 					nextLine := strings.TrimSpace(lines[i+1])
 					if strings.HasPrefix(nextLine, "=>") {
 						nextParts := strings.Fields(nextLine)
-						if len(nextParts) >= 2 {
+						if len(nextParts) >= 3 {
+							replacement = nextParts[1] + " " + nextParts[2]
+						} else if len(nextParts) >= 2 {
 							replacement = nextParts[1]
-							i++ // skip the replacement line in the next iteration
 						}
+						i++ // skip the replacement line in the next iteration
 					}
 				}
 
@@ -325,7 +327,7 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 	if len(replaced) > 0 {
 		cmd := env.newGoModCommand(ctx, "edit")
 		for o, n := range replaced {
-			cmd.Args = append(cmd.Args, "-replace", fmt.Sprintf("%s=%s", o, n))
+			cmd.Args = append(cmd.Args, "-replace", fmt.Sprintf("%s=%s", ReplacementPath(o).Param(), ReplacementPath(n).Param()))
 		}
 		err := env.runCommand(ctx, cmd)
 		if err != nil {
