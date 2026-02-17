@@ -229,7 +229,7 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 				}
 				continue
 			}
-			if parts[0] == "dep" && len(parts) >= 3 {
+			if (parts[0] == "dep" || parts[0] == "indirect") && len(parts) >= 3 {
 				mod, ver := parts[1], parts[2]
 				
 				// if we already have this dependency, check if versions match
@@ -413,12 +413,11 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 			// Check if this module is even in our current module graph
 			currentVer, ok := currentMods[mod]
 			if !ok {
-				// Not in the graph, don't pin it (this is the key to speed!)
-				continue
-			}
-
-			// If it's already at the version we want, skip pinning
-			if currentVer == ver {
+				// We still need to pin it even if not in current graph,
+				// as it might be an indirect dependency that becomes
+				// relevant after we add other modules or tidy.
+			} else if currentVer == ver {
+				// If it's already at the version we want, skip pinning
 				continue
 			}
 
